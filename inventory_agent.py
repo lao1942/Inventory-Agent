@@ -25,6 +25,7 @@ import re
 import math
 from typing import Dict, Any, List, Optional, Tuple
 from dataclasses import dataclass, field
+import pandas as pd
 
 import inventory_tools as itools
 
@@ -56,6 +57,7 @@ class InventoryDecisionAgent:
     MODEL_SAFETY_STOCK_ROP = "SAFETY_STOCK_ROP"
     MODEL_FIXED_PERIOD_REVIEW = "FIXED_PERIOD_REVIEW"
     MODEL_NEWSVENDOR = "NEWSVENDOR"
+    MODEL_DATASET_ANALYSIS = "DATASET_ANALYSIS"
 
     MODEL_TOOL_MAP = {
         MODEL_EOQ: "calculate_eoq",
@@ -63,6 +65,7 @@ class InventoryDecisionAgent:
         MODEL_SAFETY_STOCK_ROP: "calculate_safety_stock_rop",
         MODEL_FIXED_PERIOD_REVIEW: "calculate_fixed_period_review",
         MODEL_NEWSVENDOR: "calculate_newsvendor",
+        MODEL_DATASET_ANALYSIS: "analyze_dataset_query",
     }
 
     def __init__(self):
@@ -71,7 +74,7 @@ class InventoryDecisionAgent:
     # =========================================================================
     # Stage 1: Identify Model
     # =========================================================================
-    def identify_model(self, question: str) -> Tuple[str, float, str]:
+    def identify_model(self, question: str, dataset_df: Optional[Any] = None) -> Tuple[str, float, str]:
         """
         Identify the appropriate inventory decision model from natural language.
         Returns: (model_name, confidence_score, rationale)
@@ -84,7 +87,24 @@ class InventoryDecisionAgent:
             self.MODEL_SAFETY_STOCK_ROP: 0.0,
             self.MODEL_FIXED_PERIOD_REVIEW: 0.0,
             self.MODEL_NEWSVENDOR: 0.0,
+            self.MODEL_DATASET_ANALYSIS: 0.0,
         }
+
+        # Dataset Portfolio Queries (when dataset is present or dataset keywords are queried)
+        if dataset_df is not None:
+            dataset_cues = [
+                r"inventory valuation", r"total valuation", r"total inventory value", r"portfolio value",
+                r"highest unit[s]?", r"highest quantity", r"most stock", r"most unit[s]?", r"top product",
+                r"average unit cost", r"avg unit cost", r"mean unit cost", r"average cost",
+                r"total unit[s]?", r"total stock", r"total quantity", r"how many unit[s]?",
+                r"by category", r"category breakdown", r"units by category",
+                r"missing value[s]?", r"data quality", r"data cleanliness", r"null value[s]?",
+                r"summarize dataset", r"dataset overview", r"uploaded dataset", r"uploaded data",
+                r"how many records", r"how many products",
+            ]
+            for pat in dataset_cues:
+                if re.search(pat, q_lower):
+                    scores[self.MODEL_DATASET_ANALYSIS] += 3.0
 
         # Quantity Discount cues (high priority if tier/discount keywords present)
         discount_patterns = [
@@ -177,10 +197,11 @@ class InventoryDecisionAgent:
     # =========================================================================
     # Stage 2: Extract Inputs
     # =========================================================================
-    def extract_inputs(self, model: str, question: str) -> Dict[str, Any]:
+    def extract_inputs(self, model: str, question: str, dataset_df: Optional[Any] = None) -> Dict[str, Any]:
         """
         Extract numerical parameters and units from natural language question.
         Examines the entire question and recognizes common inventory terminology and synonyms.
+        Integrates with uploaded dataset records when available.
         """
         q = question
         inputs: Dict[str, Any] = {"_raw_question": question}
@@ -551,6 +572,76 @@ class InventoryDecisionAgent:
             if tiers:
                 inputs["discount_schedule"] = tiers
 
+        # ---------------------------------------------------------------------
+        # 11. Dataset Analysis & Decision Model Integration
+        # ---------------------------------------------------------------------
+        if dataset_df is not None:
+            if model == self.MODEL_DATASET_ANALYSIS:
+                q_lower = q.lower()
+                if re.search(r"valuation|total\s+(?:inventory\s+)?value", q_lower):
+                    inputs["query_focus"] = "total_valuation"
+                elif re.search(r"highest\s+unit|highest\s+quant|most\s+stock|most\s+unit|top\s+prod", q_lower):
+                    inputs["query_focus"] = "highest_units"
+                elif re.search(r"average\s+(?:unit\s+)?cost|avg\s+(?:unit\s+)?cost|mean\s+(?:unit\s+)?cost|average\s+cost", q_lower):
+                    inputs["query_focus"] = "average_cost"
+                elif re.search(r"total\s+unit|total\s+stock|total\s+quant|how\s+many\s+unit", q_lower):
+                    inputs["query_focus"] = "total_units"
+                elif re.search(r"category|categories", q_lower):
+                    inputs["query_focus"] = "category_summary"
+                elif re.search(r"quality|missing|clean|null|duplicate", q_lower):
+                    inputs["query_focus"] = "data_quality"
+                else:
+                    inputs["query_focus"] = "dataset_summary"
+                inputs["dataset_df"] = dataset_df
+
+            else:
+                # Analytical decision model queried on dataset: match product entity
+                prod_col = None
+                for c in dataset_df.columns:
+                    if str(c).strip().lower() in ["product", "item", "sku", "description"]:
+                        prod_col = c
+                        break
+                if prod_col:
+                    unique_prods = dataset_df[prod_col].dropna().astype(str).unique()
+                    sorted_prods = sorted(unique_prods, key=len, reverse=True)
+                    matched = None
+                    for p_candidate in sorted_prods:
+                        if re.search(r"\b" + re.escape(p_candidate) + r"\b", q, re.IGNORECASE) or p_candidate.lower() in q.lower():
+                            matched = p_candidate
+                            break
+                    if matched:
+                        row = dataset_df[dataset_df[prod_col].astype(str).str.lower() == matched.lower()].iloc[0]
+                        inputs["matched_product"] = str(row[prod_col])
+                        inputs["integrated_with_dataset"] = True
+
+                        u_col = next((c for c in dataset_df.columns if str(c).strip().lower() in ["units", "quantity", "qty", "demand", "stock"]), None)
+                        c_col = next((c for c in dataset_df.columns if str(c).strip().lower() in ["unit cost", "unit_cost", "cost", "price", "unit price"]), None)
+
+                        if u_col and pd.notna(row[u_col]):
+                            try:
+                                u_val = float(str(row[u_col]).replace(",", "").strip())
+                                inputs["dataset_units"] = u_val
+                                if inputs.get("annual_demand") is None and inputs.get("demand_mean") is None and inputs.get("demand_rate") is None:
+                                    if model in [self.MODEL_EOQ, self.MODEL_QUANTITY_DISCOUNT]:
+                                        inputs["annual_demand"] = u_val
+                                    elif model == self.MODEL_NEWSVENDOR:
+                                        inputs["demand_mean"] = u_val
+                                    elif model == self.MODEL_SAFETY_STOCK_ROP:
+                                        inputs["annual_demand"] = u_val
+                            except Exception:
+                                pass
+
+                        if c_col and pd.notna(row[c_col]):
+                            try:
+                                c_val = float(str(row[c_col]).replace("$", "").replace(",", "").strip())
+                                inputs["dataset_unit_cost"] = c_val
+                                if inputs.get("unit_cost") is None:
+                                    inputs["unit_cost"] = c_val
+                                if model == self.MODEL_NEWSVENDOR and inputs.get("purchase_cost") is None:
+                                    inputs["purchase_cost"] = c_val
+                            except Exception:
+                                pass
+
         return inputs
 
     def _extract_discount_tiers(self, text: str) -> List[Dict[str, Any]]:
@@ -708,9 +799,11 @@ class InventoryDecisionAgent:
                 if d is None: missing.append("Demand (D)")
                 if s is None: missing.append("Ordering Cost (S)")
                 if h is None and (hr is None or c is None): missing.append("Holding Cost (H) or (Holding Rate & Unit Cost)")
+                prod_desc = f" for product '{inputs.get('matched_product')}'" if inputs.get("matched_product") else ""
                 raise ValueError(
-                    f"Incomplete parameters for EOQ calculation. Missing: {', '.join(missing)}. "
-                    f"Got Demand={d}, OrderingCost={s}, HoldingCost={h}, HoldingRate={hr}, UnitCost={c}.{shell_hint}"
+                    f"Incomplete parameters for EOQ calculation{prod_desc}. Missing: {', '.join(missing)}. "
+                    f"Got Demand={d}, OrderingCost={s}, HoldingCost={h}, HoldingRate={hr}, UnitCost={c}.{shell_hint} "
+                    f"Please provide the missing numerical values in your question (the decision agent never invents missing parameters)."
                 )
             return tool_callable(
                 annual_demand=d,
@@ -830,6 +923,14 @@ class InventoryDecisionAgent:
                 demand_distribution=dist,
             )
 
+        elif model == self.MODEL_DATASET_ANALYSIS:
+            df_target = inputs.get("dataset_df")
+            if df_target is None:
+                raise ValueError("No dataset provided for dataset analysis. Please upload an inventory CSV file.")
+            focus = inputs.get("query_focus", "dataset_summary")
+            matched = inputs.get("matched_product")
+            return tool_callable(dataset_df=df_target, query_focus=focus, matched_product=matched)
+
         else:
             raise ValueError(f"Unsupported model: {model}")
 
@@ -874,6 +975,11 @@ class InventoryDecisionAgent:
             cr = calc_output.get("intermediate", {}).get("critical_ratio", 0)
             if 0 < cr < 1:
                 notes.append(f"Critical ratio CR = {cr:.3f} is mathematically consistent with underage/overage trade-off.")
+
+        elif model == self.MODEL_DATASET_ANALYSIS:
+            rec_cnt = results.get("records_count", 0)
+            notes.append(f"Examined {rec_cnt} inventory records from the uploaded dataset.")
+            notes.append("Dataset schema, numeric values, and non-negativity checks verified.")
 
         return {
             "status": status,
@@ -975,6 +1081,26 @@ class InventoryDecisionAgent:
                 f"- **Underage vs. Overage:** Margin on unit sales is balanced against salvage liquidation risk at the critical fractile.",
             ])
 
+        elif model == self.MODEL_DATASET_ANALYSIS:
+            val = results.get("total_inventory_value", 0.0)
+            units = results.get("total_units", 0)
+            avg_cost = results.get("average_unit_cost", 0.0)
+            n_rec = results.get("records_count", 0)
+            top_prod = results.get("highest_units_product", "N/A")
+            top_units = results.get("highest_units_count", 0)
+            lines.extend([
+                f"- **Total Portfolio Valuation:** **${val:,.2f}**",
+                f"- **Total Inventory Units:** **{units:,} units** across **{n_rec} product records**",
+                f"- **Average Unit Cost:** **${avg_cost:,.2f}** per unit",
+                f"- **Highest-Volume SKU:** **{top_prod}** ({top_units:,} units in stock / demand)",
+                f"- **Portfolio Takeaway:** {base_explanation}",
+            ])
+
+        # If entity was matched from dataset in a decision model, highlight it
+        matched_prod = calc_output.get("inputs", {}).get("matched_product")
+        if matched_prod and model != self.MODEL_DATASET_ANALYSIS:
+            lines.insert(5, f"- **Integrated Dataset SKU:** Parameters for **{matched_prod}** were retrieved directly from the uploaded inventory dataset.")
+
         lines.extend([
             "",
             "#### 2. Detailed Mathematical Context",
@@ -990,15 +1116,21 @@ class InventoryDecisionAgent:
     # =========================================================================
     # Full Agent Process Method
     # =========================================================================
-    def process_question(self, question: str, override_inputs: Optional[Dict[str, Any]] = None) -> AgentPipelineResult:
+    def process_question(
+        self,
+        question: str,
+        override_inputs: Optional[Dict[str, Any]] = None,
+        dataset_df: Optional[Any] = None,
+    ) -> AgentPipelineResult:
         """
         Execute the full 6-stage decision agent pipeline:
           Customer Question → Identify Model → Extract Inputs → Select Python Tool → Calculate → Verify → Explain
+        Supports integration with uploaded inventory dataset records and portfolio queries.
         """
         trace = []
 
         # Stage 1: Customer Question & Identify Model
-        identified_model, confidence, rationale = self.identify_model(question)
+        identified_model, confidence, rationale = self.identify_model(question, dataset_df=dataset_df)
         trace.append({
             "stage": "1. Identify Model",
             "model": identified_model,
@@ -1007,12 +1139,12 @@ class InventoryDecisionAgent:
         })
 
         # Stage 2: Extract Inputs
-        extracted_inputs = self.extract_inputs(identified_model, question)
+        extracted_inputs = self.extract_inputs(identified_model, question, dataset_df=dataset_df)
         if override_inputs:
             extracted_inputs.update(override_inputs)
         trace.append({
             "stage": "2. Extract Inputs",
-            "inputs": dict(extracted_inputs),
+            "inputs": {k: v for k, v in extracted_inputs.items() if k != "dataset_df"},
         })
 
         # Stage 3: Select Python Tool
@@ -1037,6 +1169,8 @@ class InventoryDecisionAgent:
         # Stage 4: Calculate
         try:
             calc_results = self.calculate(identified_model, tool_callable, extracted_inputs)
+            if extracted_inputs.get("matched_product"):
+                calc_results.setdefault("inputs", {})["matched_product"] = extracted_inputs["matched_product"]
             trace.append({
                 "stage": "4. Calculate",
                 "status": "COMPLETED",

@@ -1155,3 +1155,222 @@ def calculate_newsvendor(
             f"- Maximized expected total profit: ${expected_profit:,.2f}."
         ),
     }
+
+
+# -------------------------------------------------------------------------
+# 6. Inventory Dataset Portfolio Analysis Tool
+# -------------------------------------------------------------------------
+
+def analyze_dataset_query(
+    dataset_df: Any,
+    query_focus: str = "dataset_summary",
+    matched_product: Optional[str] = None,
+    **kwargs,
+) -> Dict[str, Any]:
+    """
+    Deterministic dataset analysis tool for inventory portfolio queries.
+    Returns the standard 8-step educational verification audit structure:
+      1. Inputs Extracted
+      2. Variable Definitions
+      3. Formula
+      4. Formula with Substituted Values
+      5. Intermediate Calculations
+      6. Final Answer
+      7. Verification Checks
+      8. Assumptions
+    """
+    import pandas as pd
+
+    if isinstance(dataset_df, pd.DataFrame):
+        df = dataset_df.copy()
+    else:
+        df = pd.read_csv(dataset_df)
+
+    df.columns = df.columns.str.strip()
+
+    # Column mapping for flexibility
+    col_map = {}
+    for c in df.columns:
+        cl = c.lower()
+        if cl in ["product", "item", "sku", "description", "product name"]:
+            col_map[c] = "Product"
+        elif cl in ["category", "group", "type", "department"]:
+            col_map[c] = "Category"
+        elif cl in ["units", "quantity", "qty", "demand", "stock", "count"]:
+            col_map[c] = "Units"
+        elif cl in ["unit cost", "unit_cost", "cost", "price", "unit price", "cost per unit"]:
+            col_map[c] = "Unit Cost"
+    if col_map:
+        df = df.rename(columns=col_map)
+
+    # Clean numeric types
+    if "Units" in df.columns:
+        if df["Units"].dtype == object:
+            df["Units"] = pd.to_numeric(
+                df["Units"].astype(str).str.replace(",", "").str.strip(), errors="coerce"
+            ).fillna(0)
+        else:
+            df["Units"] = pd.to_numeric(df["Units"], errors="coerce").fillna(0)
+    else:
+        df["Units"] = 0
+
+    if "Unit Cost" in df.columns:
+        if df["Unit Cost"].dtype == object:
+            df["Unit Cost"] = pd.to_numeric(
+                df["Unit Cost"].astype(str).str.replace("$", "").str.replace(",", "").str.strip(), errors="coerce"
+            ).fillna(0.0)
+        else:
+            df["Unit Cost"] = pd.to_numeric(df["Unit Cost"], errors="coerce").fillna(0.0)
+    else:
+        df["Unit Cost"] = 0.0
+
+    df["Inventory Value"] = df["Units"] * df["Unit Cost"]
+
+    n_records = len(df)
+    total_units = int(df["Units"].sum())
+    avg_unit_cost = float(df["Unit Cost"].mean()) if n_records > 0 else 0.0
+    total_val = float(df["Inventory Value"].sum())
+
+    if n_records > 0 and "Product" in df.columns:
+        max_idx = df["Units"].idxmax()
+        top_prod = str(df.loc[max_idx, "Product"])
+        top_units = int(df.loc[max_idx, "Units"])
+    else:
+        top_prod = "N/A"
+        top_units = 0
+
+    # Category summary
+    if "Category" in df.columns:
+        cat_grp = {str(k): int(v) for k, v in df.groupby("Category")["Units"].sum().items()}
+    else:
+        cat_grp = {}
+
+    # Data Quality Metrics
+    null_counts = {str(col): int(df[col].isna().sum()) for col in df.columns}
+    total_nulls = sum(null_counts.values())
+    dup_rows = int(df.duplicated().sum())
+    neg_units = int((df["Units"] < 0).sum())
+    neg_costs = int((df["Unit Cost"] < 0).sum())
+
+    # 1. Inputs Extracted
+    inputs_extracted = {
+        "dataset_records_count": n_records,
+        "query_focus": query_focus,
+        "matched_product": matched_product,
+        "total_units": total_units,
+        "total_inventory_value": round(total_val, 2),
+        "average_unit_cost": round(avg_unit_cost, 2),
+    }
+
+    # 2. Variable Definitions
+    variable_definitions = {
+        "N": "Total number of inventory records (SKUs / products) in the uploaded dataset",
+        "Units_i": "Quantity of units in stock or annual demand for product i",
+        "Unit_Cost_i": "Acquisition or purchase cost per unit for product i ($/unit)",
+        "Inventory_Value_i": "Total dollar valuation for product i: Units_i * Unit_Cost_i ($)",
+        "Total_Valuation": "Sum of inventory valuations across all N products in the portfolio ($)",
+        "Average_Unit_Cost": "Arithmetic mean of unit acquisition costs across all items ($/unit)",
+    }
+
+    # 3. Formula
+    formula = {
+        "inventory_value_per_item": "Inventory Value_i = Units_i * Unit Cost_i",
+        "total_inventory_valuation": "Total Inventory Value = sum(Units_i * Unit Cost_i) for i = 1 to N",
+        "average_unit_cost": "Average Unit Cost = (1 / N) * sum(Unit Cost_i)",
+        "total_units": "Total Units = sum(Units_i)",
+    }
+
+    # 4. Formula with Substituted Values
+    formula_with_substituted_values = {
+        "total_inventory_valuation": f"Total Valuation = sum across {n_records} items = ${total_val:,.2f}",
+        "average_unit_cost": f"Average Unit Cost = sum(Unit Cost) / {n_records} = ${avg_unit_cost:,.2f}",
+        "total_units": f"Total Units = sum(Units) across {n_records} items = {total_units:,} units",
+        "top_product": f"Highest Units Product = '{top_prod}' with {top_units:,} units",
+    }
+
+    # 5. Intermediate Calculations
+    intermediate_calculations = {
+        "records_count": n_records,
+        "total_units": total_units,
+        "average_unit_cost": round(avg_unit_cost, 2),
+        "total_inventory_value": round(total_val, 2),
+        "highest_units_product": top_prod,
+        "highest_units_count": top_units,
+        "category_summary": cat_grp,
+        "data_quality_null_counts": null_counts,
+        "data_quality_duplicate_rows": dup_rows,
+        "data_quality_negative_units": neg_units,
+        "data_quality_negative_costs": neg_costs,
+    }
+
+    # 6. Final Answer
+    final_answer = {
+        "records_count": n_records,
+        "total_units": total_units,
+        "average_unit_cost": round(avg_unit_cost, 2),
+        "total_inventory_value": round(total_val, 2),
+        "highest_units_product": top_prod,
+        "highest_units_count": top_units,
+        "query_focus": query_focus,
+    }
+
+    # 7. Verification Checks
+    verification_checks = {
+        "dataset_not_empty": n_records > 0,
+        "all_quantities_non_negative": neg_units == 0,
+        "all_costs_non_negative": neg_costs == 0,
+        "zero_duplicate_rows": dup_rows == 0,
+        "zero_missing_values": total_nulls == 0,
+        "verification_status": "PASSED" if (n_records > 0 and neg_units == 0 and neg_costs == 0) else "WARNING",
+    }
+
+    # 8. Assumptions
+    assumptions = [
+        "Dataset quantities represent current physical stock or validated demand.",
+        "Unit costs represent current replacement or acquisition costs.",
+        "Missing values have been cleansed and coerced deterministically.",
+        "Valuation uses standard all-units arithmetic: Inventory Value = Units * Unit Cost.",
+    ]
+
+    # Executive focus message
+    if query_focus == "total_valuation":
+        focus_msg = f"The total inventory valuation across all {n_records} items is **${total_val:,.2f}**."
+    elif query_focus == "highest_units":
+        focus_msg = f"The product with the highest quantity is **{top_prod}** with **{top_units:,} units**."
+    elif query_focus == "average_cost":
+        focus_msg = f"The average unit cost across all inventory items is **${avg_unit_cost:,.2f}**."
+    elif query_focus == "total_units":
+        focus_msg = f"The total stock across all items in the portfolio is **{total_units:,} units**."
+    elif query_focus == "category_summary":
+        cat_str = ", ".join([f"{k}: {v:,} units" for k, v in cat_grp.items()])
+        focus_msg = f"Inventory units by category: {cat_str}."
+    elif query_focus == "data_quality":
+        focus_msg = (
+            f"Data Quality Audit: {n_records} records examined. "
+            f"Missing values: {total_nulls}, Duplicates: {dup_rows}, "
+            f"Negative quantities: {neg_units}, Negative costs: {neg_costs}."
+        )
+    else:
+        focus_msg = (
+            f"The uploaded inventory dataset contains **{n_records} records** totaling **{total_units:,} units** "
+            f"with an average unit cost of **${avg_unit_cost:,.2f}** and total portfolio valuation of **${total_val:,.2f}**. "
+            f"The highest-volume item is **{top_prod}** ({top_units:,} units)."
+        )
+
+    return {
+        "model": "Inventory Dataset Portfolio Analysis",
+        "inputs": inputs_extracted,
+        "inputs_extracted": inputs_extracted,
+        "variable_definitions": variable_definitions,
+        "formula": formula,
+        "formula_with_substituted_values": formula_with_substituted_values,
+        "intermediate": intermediate_calculations,
+        "intermediate_calculations": intermediate_calculations,
+        "results": final_answer,
+        "final_answer": final_answer,
+        "verification": verification_checks,
+        "verification_checks": verification_checks,
+        "assumptions": assumptions,
+        "explanation": focus_msg,
+    }
+

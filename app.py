@@ -238,7 +238,12 @@ def run_streamlit_app():
 
         st.markdown("---")
         st.subheader("Data Upload")
-        uploaded_csv = st.file_uploader("Upload CSV File", type=["csv"], key="sidebar_csv_uploader")
+        if st.session_state.get("active_dataset_summary") is not None:
+            sum_data = st.session_state["active_dataset_summary"]
+            st.success(f"✓ Active Dataset: {sum_data['n_rows']:,} records")
+            st.caption(f"Valuation: ${sum_data['total_inventory_value']:,.2f}")
+        else:
+            st.info("No CSV uploaded yet. Use the upload section in the main panel above the query input.")
 
         st.markdown("---")
         st.caption("Google DeepMind • Supply Chain Analytics • BAN 517")
@@ -252,11 +257,51 @@ def run_streamlit_app():
         unsafe_allow_html=True,
     )
 
+    # ---------------------------------------------------------------------
+    # Section: 📁 Upload & Analyze Inventory Dataset (CSV)
+    # (Requirement 1: Placed directly above the natural-language question input)
+    # ---------------------------------------------------------------------
+    st.markdown("### 📁 Upload & Analyze Inventory Dataset (CSV)")
+    st.caption("Upload your product catalog or inventory records (CSV) to automatically analyze portfolio metrics and integrate with decision models.")
+
+    uploaded_csv = st.file_uploader(
+        "Upload CSV File",
+        type=["csv"],
+        key="main_inventory_csv_uploader",
+        help="Upload an inventory CSV file. Expected columns: Product, Category, Units, Unit Cost.",
+    )
+
+    inventory_df = None
+    if uploaded_csv is not None:
+        try:
+            dataset_summary = process_inventory_csv(uploaded_csv)
+            if dataset_summary["valid"]:
+                inventory_df = dataset_summary["df"]
+                st.session_state["active_dataset_summary"] = dataset_summary
+                _render_csv_upload_section(dataset_summary)
+            else:
+                st.session_state["active_dataset_summary"] = None
+                st.error(
+                    f"❌ **Schema Validation Failed:** The uploaded CSV is missing required column(s): "
+                    f"**{', '.join(dataset_summary['missing_columns'])}**. "
+                    f"Required columns are: `{', '.join(dataset_summary['required_columns'])}`."
+                )
+                st.info(f"**Columns found in uploaded file:** {', '.join(dataset_summary['column_names']) if dataset_summary['column_names'] else 'None'}")
+                st.markdown("**Uploaded Data Preview:**")
+                st.dataframe(dataset_summary["df"], use_container_width=True)
+        except Exception as e:
+            st.error(f"❌ Error processing uploaded CSV file: {str(e)}")
+            st.session_state["active_dataset_summary"] = None
+    else:
+        st.session_state["active_dataset_summary"] = None
+
+    st.markdown("---")
+
     query_input = st.text_area(
         "Enter Natural Language Inventory Question:",
         value=st.session_state["inventory_query"],
         height=110,
-        placeholder="e.g., Annual demand is 12,000 units, ordering cost is $100, holding cost is $1.50. What is our EOQ?",
+        placeholder="e.g., Annual demand is 12,000 units, ordering cost is $100, holding cost is $1.50. What is our EOQ? Or ask questions about your uploaded dataset.",
         key="query_text_area",
     )
 
@@ -278,16 +323,10 @@ def run_streamlit_app():
         else:
             st.session_state["inventory_query"] = query_input
             with st.spinner("Executing 6-Stage Cognitive Inventory Decision Pipeline..."):
-                res = agent.process_question(query_input)
+                res = agent.process_question(query_input, dataset_df=inventory_df)
                 st.session_state["pipeline_result"] = res
 
     res: Optional[AgentPipelineResult] = st.session_state["pipeline_result"]
-
-    # ---------------------------------------------------------------------
-    # CSV Data Upload & Portfolio Analytics Section
-    # ---------------------------------------------------------------------
-    if uploaded_csv is not None:
-        _render_csv_upload_section(uploaded_csv)
 
     # ---------------------------------------------------------------------
     # 3. Decision Results Presentation (Banner, Metric Cards, Tabs)
@@ -295,8 +334,13 @@ def run_streamlit_app():
     if res is not None:
         if res.status != "SUCCESS":
             st.error(f"❌ Decision Pipeline Error: {res.error_message}")
+            st.info(
+                "💡 **Supply Chain Guidance:** Inventory decision models require complete parameter specifications to yield deterministic, mathematically sound recommendations. The decision agent never invents or assumes missing numerical values. Please provide the required parameter(s) above and re-run."
+            )
             if res.extracted_inputs:
-                st.write("**Partially Extracted Inputs:**", res.extracted_inputs)
+                with st.expander("🔍 Extracted Parameters from Question & Dataset", expanded=True):
+                    clean_in = {k: v for k, v in res.extracted_inputs.items() if not k.startswith("_") and k != "dataset_df"}
+                    st.json(clean_in)
         else:
             calc = res.calculation_results or {}
             results = calc.get("results", {})
@@ -339,12 +383,15 @@ def process_inventory_csv(csv_file_or_df: Any) -> Dict[str, Any]:
     Process uploaded CSV inventory data using pandas.
     Validates required columns: Product, Category, Units, Unit Cost.
     Performs data calculations:
-      1. Total Units
-      2. Average Unit Cost
-      3. Product with Highest Units
-      4. Total Units by Category
-      5. Calculated Column: Inventory Value = Units * Unit Cost
-      6. Total Inventory Value across all products
+      1. Total number of records (n_rows)
+      2. Summary statistics across numerical metrics (describe())
+      3. Total Units
+      4. Average Unit Cost
+      5. Product with Highest Units
+      6. Total Units by Category
+      7. Calculated Column: Inventory Value = Units * Unit Cost
+      8. Total Inventory Value across all products
+      9. Missing values and data-quality checks
     """
     import pandas as pd
 
@@ -413,6 +460,42 @@ def process_inventory_csv(csv_file_or_df: Any) -> Dict[str, Any]:
     # 6. Total Inventory Value across all products
     total_inventory_value = float(df["Inventory Value"].sum())
 
+    # 7. Summary statistics across numerical metrics (Requirement 4)
+    summary_stats = df[["Units", "Unit Cost", "Inventory Value"]].describe()
+
+    # 8. Missing values and data-quality checks (Requirement 4)
+    null_counts = {str(col): int(df[col].isna().sum()) for col in df.columns}
+    total_nulls = sum(null_counts.values())
+    dup_rows = int(df.duplicated().sum())
+    neg_units = int((df["Units"] < 0).sum())
+    neg_costs = int((df["Unit Cost"] < 0).sum())
+
+    quality_notes = []
+    if total_nulls == 0:
+        quality_notes.append("✓ No missing values detected in any required columns.")
+    else:
+        quality_notes.append(f"⚠ {total_nulls} missing (null) values detected across dataset columns.")
+
+    if dup_rows == 0:
+        quality_notes.append("✓ No duplicate inventory records detected.")
+    else:
+        quality_notes.append(f"⚠ {dup_rows} duplicate record(s) detected.")
+
+    if neg_units == 0 and neg_costs == 0:
+        quality_notes.append("✓ All product units and unit costs are non-negative.")
+    else:
+        quality_notes.append(f"⚠ Detected {neg_units} negative unit quantities and {neg_costs} negative unit costs.")
+
+    data_quality = {
+        "null_counts": null_counts,
+        "total_nulls": total_nulls,
+        "duplicate_rows": dup_rows,
+        "negative_units_count": neg_units,
+        "negative_cost_count": neg_costs,
+        "quality_notes": quality_notes,
+        "status": "PASSED" if (total_nulls == 0 and dup_rows == 0 and neg_units == 0 and neg_costs == 0) else "WARNING",
+    }
+
     # Formatted display dataframe
     df_display = df.copy()
     df_display["Unit Cost"] = df_display["Unit Cost"].apply(lambda x: f"${x:,.2f}")
@@ -435,24 +518,25 @@ def process_inventory_csv(csv_file_or_df: Any) -> Dict[str, Any]:
         "highest_units_count": highest_units_count,
         "total_inventory_value": total_inventory_value,
         "category_summary": category_summary,
+        "summary_statistics": summary_stats,
+        "data_quality": data_quality,
     }
 
 
-def _render_csv_upload_section(uploaded_file: Any):
-    """Render the uploaded CSV dataset, schema validation, and descriptive analysis results."""
+def _render_csv_upload_section(csv_or_results: Any):
+    """Render the uploaded CSV dataset, schema validation, summary statistics, and data-quality checks."""
     import streamlit as st
     import pandas as pd
     import altair as alt
 
-    st.markdown("---")
-    st.markdown("### 📂 Uploaded CSV Data & Inventory Portfolio Analysis")
-    st.caption("Automated CSV ingestion, schema validation, and portfolio inventory descriptive analytics.")
-
-    try:
-        results = process_inventory_csv(uploaded_file)
-    except Exception as e:
-        st.error(f"❌ Error processing uploaded CSV file: {str(e)}")
-        return
+    if isinstance(csv_or_results, dict) and "valid" in csv_or_results:
+        results = csv_or_results
+    else:
+        try:
+            results = process_inventory_csv(csv_or_results)
+        except Exception as e:
+            st.error(f"❌ Error processing uploaded CSV file: {str(e)}")
+            return
 
     # Schema Validation Check
     if not results["valid"]:
@@ -466,22 +550,46 @@ def _render_csv_upload_section(uploaded_file: Any):
         st.dataframe(results["df"], use_container_width=True)
         return
 
-    # Metadata Display: Rows, Columns, Column Names
+    # Metadata Display: Rows, Columns, Column Names (Requirement 4)
     m1, m2, m3 = st.columns([1, 1, 2.5])
-    m1.metric("Dataset Rows", f"{results['n_rows']:,}")
-    m2.metric("Dataset Columns", f"{len(results['original_column_names']):,}")
-    m3.info(f"**Column Names:** {', '.join(results['original_column_names'])}")
+    m1.metric("Total Records", f"{results['n_rows']:,}")
+    m2.metric("Total Columns", f"{len(results['original_column_names']):,}")
+    m3.info(f"**Verified Columns:** {', '.join(results['original_column_names'])}")
 
-    # Analysis Results KPI Metric Cards
-    st.markdown("#### 📊 Inventory Analysis Summary")
+    # Analysis Results KPI Metric Cards (Requirement 4)
     kpi1, kpi2, kpi3, kpi4 = st.columns(4)
     kpi1.metric("Total Units", f"{results['total_units']:,}")
     kpi2.metric("Average Unit Cost", f"${results['avg_unit_cost']:,.2f}")
     kpi3.metric("Product with Highest Units", results["highest_units_product"], f"{results['highest_units_count']:,} units")
     kpi4.metric("Total Inventory Value", f"${results['total_inventory_value']:,.2f}")
 
+    # Dataset Preview (Requirement 3)
+    with st.expander("👁️ View Uploaded Dataset Records & Calculated Values", expanded=True):
+        st.dataframe(results["df_display"], use_container_width=True)
+
+    # Missing values and data-quality checks (Requirement 4)
+    dq = results.get("data_quality", {})
+    dq_status = dq.get("status", "PASSED")
+    dq_icon = "✅" if dq_status == "PASSED" else "⚠️"
+
+    with st.expander(f"🛡️ Data Quality & Missing Values Audit ({dq_icon} {dq_status})", expanded=False):
+        c_dq1, c_dq2 = st.columns([1.5, 1.5])
+        with c_dq1:
+            st.markdown("**Data Hygiene Checks:**")
+            for note in dq.get("quality_notes", []):
+                st.markdown(f"- {note}")
+        with c_dq2:
+            st.markdown("**Column Null (Missing) Counts:**")
+            null_s = pd.Series(dq.get("null_counts", {}), name="Missing Values")
+            st.dataframe(null_s, use_container_width=True)
+
+    # Inventory Quantities & Summary Statistics (Requirement 4)
+    with st.expander("📊 Inventory Quantities & Summary Statistics (describe)", expanded=False):
+        st.caption("Distributional summary statistics across Units, Unit Cost, and calculated Inventory Value.")
+        st.dataframe(results["summary_statistics"], use_container_width=True)
+
     # Total Units by Category
-    st.markdown("#### 🏷️ Total Units by Category")
+    st.markdown("##### 🏷️ Total Units by Category")
     c_cat1, c_cat2 = st.columns([1.2, 1.8])
     with c_cat1:
         cat_df_display = results["category_summary"].copy()
@@ -496,14 +604,9 @@ def _render_csv_upload_section(uploaded_file: Any):
                 y=alt.Y("Units:Q", title="Total Units"),
                 tooltip=["Category", "Units"],
             )
-            .properties(height=240)
+            .properties(height=220)
         )
         st.altair_chart(cat_chart, use_container_width=True)
-
-    # Full Dataframe with calculated Inventory Value column
-    st.markdown("#### 📋 Processed Inventory Dataset (with Calculated Inventory Value)")
-    st.caption("Includes calculated column: Inventory Value = Units × Unit Cost (formatted as currency).")
-    st.dataframe(results["df_display"], use_container_width=True)
 
 
 # -------------------------------------------------------------------------
@@ -566,6 +669,20 @@ def _render_executive_banner(model: str, results: Dict[str, Any], inter: Dict[st
             f"Balances underage cost ($Cu = ${inter.get('underage_cost_Cu', 0):,.2f}) against overage cost ($Co = ${inter.get('overage_cost_Co', 0):,.2f}), "
             f"achieving a maximized expected single-period profit of <strong>${profit:,.2f}</strong>."
         )
+
+    elif model == "DATASET_ANALYSIS":
+        val = results.get("total_inventory_value", 0.0)
+        units = results.get("total_units", 0)
+        n_rows = results.get("records_count", 0)
+        avg_cost = results.get("average_unit_cost", 0.0)
+        top_prod = results.get("highest_units_product", "N/A")
+        top_cnt = results.get("highest_units_count", 0)
+        headline = f"Portfolio Valuation: ${val:,.2f} across {n_rows:,} items ({units:,} total units)"
+        details = (
+            f"The uploaded dataset contains <strong>{n_rows:,} inventory records</strong> with an average unit cost of <strong>${avg_cost:,.2f}</strong>. "
+            f"Highest-volume product: <strong>{top_prod}</strong> ({top_cnt:,} units). Overall inventory valuation is <strong>${val:,.2f}</strong>."
+        )
+
     else:
         headline = "Inventory Optimization Analysis Complete"
         details = "Review the decision parameters and execution trace below."
@@ -632,6 +749,13 @@ def _render_metric_cards(model: str, results: Dict[str, Any], inter: Dict[str, A
         c4.metric("Expected Sales", f"{results.get('expected_sales', 0):,.1f} units")
         c5.metric("Expected Leftovers", f"{results.get('expected_leftovers', 0):,.1f} units")
         c6.metric("Expected Lost Sales", f"{results.get('expected_lost_sales', 0):,.1f} units")
+
+    elif model == "DATASET_ANALYSIS":
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Total Records", f"{results.get('records_count', 0):,}")
+        c2.metric("Total Inventory Units", f"{results.get('total_units', 0):,}")
+        c3.metric("Average Unit Cost", f"${results.get('average_unit_cost', 0.0):,.2f}")
+        c4.metric("Total Inventory Value", f"${results.get('total_inventory_value', 0.0):,.2f}")
 
 
 # -------------------------------------------------------------------------
@@ -977,6 +1101,25 @@ def _render_analytics_tab(model: str, results: Dict[str, Any], inter: Dict[str, 
         )
         st.altair_chart(bar_nv, use_container_width=True)
 
+    elif model == "DATASET_ANALYSIS":
+        st.markdown("#### Portfolio Category Breakdown & Item Valuation")
+        st.caption("Distribution of inventory units across product categories from the uploaded dataset.")
+        cat_grp = inter.get("category_summary", {})
+        if cat_grp:
+            cat_df = pd.DataFrame([{"Category": k, "Units": v} for k, v in cat_grp.items()])
+            bar_chart = (
+                alt.Chart(cat_df)
+                .mark_bar(cornerRadiusTopLeft=4, cornerRadiusTopRight=4, color="#3B82F6")
+                .encode(
+                    x=alt.X("Category:N", sort="-y", title="Product Category"),
+                    y=alt.Y("Units:Q", title="Total Units in Category"),
+                    tooltip=["Category", "Units"],
+                )
+                .properties(height=340)
+            )
+            st.altair_chart(bar_chart, use_container_width=True)
+            st.dataframe(cat_df, use_container_width=True, hide_index=True)
+
 
 # -------------------------------------------------------------------------
 # Tab 3: What-If Parameter Sensitivity
@@ -987,6 +1130,10 @@ def _render_sensitivity_tab(model: str, inputs: Dict[str, Any], baseline_results
 
     st.markdown(f"### 🎛️ What-If Parameter Sensitivity Analysis")
     st.caption("Adjust key supply chain drivers to observe real-time operational trade-offs calculated via pure Python analytical formulas.")
+
+    if model == "DATASET_ANALYSIS":
+        st.info("💡 **Dataset Sensitivity Analysis:** What-If parameter sliders apply to individual single-item models. To test sensitivity on a specific product from your dataset, ask a question such as: *'What is the EOQ for [Product Name] with ordering cost $50 and holding cost $2?'*")
+        return
 
     if model == "EOQ":
         base_d = float(inputs.get("annual_demand", 10000))
