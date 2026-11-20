@@ -381,19 +381,16 @@ def run_streamlit_app():
 def process_inventory_csv(csv_file_or_df: Any) -> Dict[str, Any]:
     """
     Process uploaded CSV inventory data using pandas.
-    Validates required columns: Product, Category, Units, Unit Cost.
-    Performs data calculations:
-      1. Total number of records (n_rows)
-      2. Summary statistics across numerical metrics (describe())
-      3. Total Units
-      4. Average Unit Cost
-      5. Product with Highest Units
-      6. Total Units by Category
-      7. Calculated Column: Inventory Value = Units * Unit Cost
-      8. Total Inventory Value across all products
-      9. Missing values and data-quality checks
+    Supports both:
+      1. BAN 517 Multicriteria Inventory Classification Schema:
+         Item Number, Item Name, UoM, Sales ($), Hits (POS Hits)
+         -> Computes 65% Sales / 35% POS Hits multicriteria stratification into A, B, C, D classes.
+      2. Classical Product Decision Catalog Schema:
+         Product, Category, Units, Unit Cost
+         -> Computes portfolio valuation, summary statistics, and powers decision models.
     """
     import pandas as pd
+    import inventory_tools as itools
 
     if isinstance(csv_file_or_df, pd.DataFrame):
         df = csv_file_or_df.copy()
@@ -403,10 +400,17 @@ def process_inventory_csv(csv_file_or_df: Any) -> Dict[str, Any]:
     # Clean whitespace in column names
     df.columns = df.columns.str.strip()
 
-    required_columns = ["Product", "Category", "Units", "Unit Cost"]
-    missing_columns = [col for col in required_columns if col not in df.columns]
+    # Detect Classification Dataset columns: Sales ($) and Hits
+    has_sales = any(str(c).strip().lower() in ["sales ($)", "sales", "annual sales", "dollar sales", "revenue"] for c in df.columns)
+    has_hits = any(str(c).strip().lower() in ["hits", "pos hits", "pos_hits", "picks", "frequency", "orders"] for c in df.columns)
+    is_classification_dataset = has_sales and has_hits
 
-    if missing_columns:
+    # Detect Decision Model Dataset columns: Product, Category, Units, Unit Cost
+    has_product_cat = all(col in df.columns for col in ["Product", "Category", "Units", "Unit Cost"])
+
+    if not is_classification_dataset and not has_product_cat:
+        required_columns = ["Product", "Category", "Units", "Unit Cost"]
+        missing_columns = [col for col in required_columns if col not in df.columns]
         return {
             "valid": False,
             "missing_columns": missing_columns,
@@ -420,59 +424,68 @@ def process_inventory_csv(csv_file_or_df: Any) -> Dict[str, Any]:
     n_rows, n_cols = df.shape
     col_names = list(df.columns)
 
-    # Clean numeric data types
-    if df["Units"].dtype == object:
-        df["Units"] = pd.to_numeric(
-            df["Units"].astype(str).str.replace(",", "").str.strip(), errors="coerce"
-        ).fillna(0)
+    classification_result = None
+    if is_classification_dataset:
+        classification_result = itools.classify_inventory_multicriteria(
+            df, sales_weight=0.65, hits_weight=0.35
+        )
+        df = classification_result["df"]
+
+    # If it has Product, Category, Units, Unit Cost (Decision Model Schema)
+    if has_product_cat:
+        if df["Units"].dtype == object:
+            df["Units"] = pd.to_numeric(
+                df["Units"].astype(str).str.replace(",", "").str.strip(), errors="coerce"
+            ).fillna(0)
+        else:
+            df["Units"] = pd.to_numeric(df["Units"], errors="coerce").fillna(0)
+
+        if df["Unit Cost"].dtype == object:
+            df["Unit Cost"] = pd.to_numeric(
+                df["Unit Cost"].astype(str).str.replace("$", "").str.replace(",", "").str.strip(), errors="coerce"
+            ).fillna(0.0)
+        else:
+            df["Unit Cost"] = pd.to_numeric(df["Unit Cost"], errors="coerce").fillna(0.0)
+
+        df["Inventory Value"] = df["Units"] * df["Unit Cost"]
+        total_units = int(df["Units"].sum())
+        avg_unit_cost = float(df["Unit Cost"].mean()) if n_rows > 0 else 0.0
+
+        if n_rows > 0:
+            max_idx = df["Units"].idxmax()
+            highest_units_product = str(df.loc[max_idx, "Product"])
+            highest_units_count = int(df.loc[max_idx, "Units"])
+        else:
+            highest_units_product = "N/A"
+            highest_units_count = 0
+
+        category_summary = df.groupby("Category")["Units"].sum().reset_index().sort_values(by="Units", ascending=False)
+        total_inventory_value = float(df["Inventory Value"].sum())
+        summary_stats = df[["Units", "Unit Cost", "Inventory Value"]].describe()
+
     else:
-        df["Units"] = pd.to_numeric(df["Units"], errors="coerce").fillna(0)
+        # Classification schema (Item Number, Item Name, UoM, Sales ($), Hits)
+        item_col = "Item Name" if "Item Name" in df.columns else ("Product" if "Product" in df.columns else df.columns[0])
+        total_units = int(df["Hits"].sum())
+        avg_unit_cost = float((df["Sales ($)"] / df["Hits"].replace(0, 1)).mean()) if n_rows > 0 else 0.0
+        max_idx = df["Hits"].idxmax() if n_rows > 0 else 0
+        highest_units_product = str(df.loc[max_idx, item_col]) if n_rows > 0 else "N/A"
+        highest_units_count = int(df.loc[max_idx, "Hits"]) if n_rows > 0 else 0
+        category_summary = df.groupby("Inventory Class")["Hits"].sum().reset_index().rename(columns={"Inventory Class": "Category", "Hits": "Units"}).sort_values(by="Units", ascending=False)
+        total_inventory_value = float(df["Sales ($)"].sum())
+        num_cols = [c for c in ["Sales ($)", "Hits", "Composite Score"] if c in df.columns]
+        summary_stats = df[num_cols].describe() if num_cols else pd.DataFrame()
 
-    if df["Unit Cost"].dtype == object:
-        df["Unit Cost"] = pd.to_numeric(
-            df["Unit Cost"].astype(str).str.replace("$", "").str.replace(",", "").str.strip(), errors="coerce"
-        ).fillna(0.0)
-    else:
-        df["Unit Cost"] = pd.to_numeric(df["Unit Cost"], errors="coerce").fillna(0.0)
-
-    # 5. Calculated Column: Inventory Value = Units * Unit Cost
-    df["Inventory Value"] = df["Units"] * df["Unit Cost"]
-
-    # 1. Total Units
-    total_units = int(df["Units"].sum())
-
-    # 2. Average Unit Cost
-    avg_unit_cost = float(df["Unit Cost"].mean()) if n_rows > 0 else 0.0
-
-    # 3. Product with highest Units
-    if n_rows > 0:
-        max_idx = df["Units"].idxmax()
-        highest_units_product = str(df.loc[max_idx, "Product"])
-        highest_units_count = int(df.loc[max_idx, "Units"])
-    else:
-        highest_units_product = "N/A"
-        highest_units_count = 0
-
-    # 4. Group by Category and calculate total Units
-    category_summary = df.groupby("Category")["Units"].sum().reset_index()
-    category_summary = category_summary.sort_values(by="Units", ascending=False)
-
-    # 6. Total Inventory Value across all products
-    total_inventory_value = float(df["Inventory Value"].sum())
-
-    # 7. Summary statistics across numerical metrics (Requirement 4)
-    summary_stats = df[["Units", "Unit Cost", "Inventory Value"]].describe()
-
-    # 8. Missing values and data-quality checks (Requirement 4)
+    # Data Quality
     null_counts = {str(col): int(df[col].isna().sum()) for col in df.columns}
     total_nulls = sum(null_counts.values())
     dup_rows = int(df.duplicated().sum())
-    neg_units = int((df["Units"] < 0).sum())
-    neg_costs = int((df["Unit Cost"] < 0).sum())
+    neg_units = int((df["Units"] < 0).sum()) if "Units" in df.columns else 0
+    neg_costs = int((df["Unit Cost"] < 0).sum()) if "Unit Cost" in df.columns else 0
 
     quality_notes = []
     if total_nulls == 0:
-        quality_notes.append("✓ No missing values detected in any required columns.")
+        quality_notes.append("✓ No missing values detected across dataset columns.")
     else:
         quality_notes.append(f"⚠ {total_nulls} missing (null) values detected across dataset columns.")
 
@@ -482,7 +495,7 @@ def process_inventory_csv(csv_file_or_df: Any) -> Dict[str, Any]:
         quality_notes.append(f"⚠ {dup_rows} duplicate record(s) detected.")
 
     if neg_units == 0 and neg_costs == 0:
-        quality_notes.append("✓ All product units and unit costs are non-negative.")
+        quality_notes.append("✓ All product units and costs are non-negative.")
     else:
         quality_notes.append(f"⚠ Detected {neg_units} negative unit quantities and {neg_costs} negative unit costs.")
 
@@ -496,20 +509,25 @@ def process_inventory_csv(csv_file_or_df: Any) -> Dict[str, Any]:
         "status": "PASSED" if (total_nulls == 0 and dup_rows == 0 and neg_units == 0 and neg_costs == 0) else "WARNING",
     }
 
-    # Formatted display dataframe
-    df_display = df.copy()
-    df_display["Unit Cost"] = df_display["Unit Cost"].apply(lambda x: f"${x:,.2f}")
-    df_display["Inventory Value"] = df_display["Inventory Value"].apply(lambda x: f"${x:,.2f}")
-    df_display["Units"] = df_display["Units"].apply(lambda x: f"{int(x):,}")
+    if is_classification_dataset:
+        df_display = classification_result["df_display"]
+    else:
+        df_display = df.copy()
+        if "Unit Cost" in df_display.columns:
+            df_display["Unit Cost"] = df_display["Unit Cost"].apply(lambda x: f"${x:,.2f}")
+        if "Inventory Value" in df_display.columns:
+            df_display["Inventory Value"] = df_display["Inventory Value"].apply(lambda x: f"${x:,.2f}")
+        if "Units" in df_display.columns:
+            df_display["Units"] = df_display["Units"].apply(lambda x: f"{int(x):,}")
 
     return {
         "valid": True,
         "missing_columns": [],
-        "required_columns": required_columns,
+        "required_columns": ["Product", "Category", "Units", "Unit Cost"] if has_product_cat else ["Item Number", "Item Name", "UoM", "Sales ($)", "Hits"],
         "df": df,
         "df_display": df_display,
         "n_rows": n_rows,
-        "n_cols": n_cols + 1,  # including calculated column
+        "n_cols": len(df.columns),
         "column_names": list(df.columns),
         "original_column_names": col_names,
         "total_units": total_units,
@@ -520,6 +538,7 @@ def process_inventory_csv(csv_file_or_df: Any) -> Dict[str, Any]:
         "category_summary": category_summary,
         "summary_statistics": summary_stats,
         "data_quality": data_quality,
+        "classification": classification_result,
     }
 
 
@@ -608,6 +627,89 @@ def _render_csv_upload_section(csv_or_results: Any):
         )
         st.altair_chart(cat_chart, use_container_width=True)
 
+    # ---------------------------------------------------------------------
+    # BAN 517 Multicriteria Inventory Classification Section
+    # ---------------------------------------------------------------------
+    if results.get("classification") is not None:
+        clf = results["classification"]
+        st.markdown("---")
+        st.markdown("### 🏷️ Multicriteria Inventory Classification (BAN 517: Classes A, B, C, D)")
+        st.caption("Stratification using **Sales ($) weighted 65%** and **POS Hits weighted 35%**, evaluated via Pareto cutoffs into final Classes A, B, C, and D.")
+
+        # Class Metric Cards (A, B, C, D)
+        kpi_c1, kpi_c2, kpi_c3, kpi_c4 = st.columns(4)
+        s_rows = clf["summary_rows"]
+        kpi_c1.metric("Class A (Vital Few)", f"{s_rows[0]['SKU Count']:,} SKUs", f"{s_rows[0]['% of Sales']}% Sales | {s_rows[0]['% of POS Hits']}% Hits")
+        kpi_c2.metric("Class B (Moderate)", f"{s_rows[1]['SKU Count']:,} SKUs", f"{s_rows[1]['% of Sales']}% Sales | {s_rows[1]['% of POS Hits']}% Hits")
+        kpi_c3.metric("Class C (Low Activity)", f"{s_rows[2]['SKU Count']:,} SKUs", f"{s_rows[2]['% of Sales']}% Sales | {s_rows[2]['% of POS Hits']}% Hits")
+        kpi_c4.metric("Class D (Slow / Dead Stock)", f"{s_rows[3]['SKU Count']:,} SKUs", f"{s_rows[3]['% of Sales']}% Sales | {s_rows[3]['% of POS Hits']}% Hits")
+
+        # Class Summary Table
+        st.markdown("##### 📊 Multicriteria Stratification Breakdown")
+        st.dataframe(clf["class_summary"], use_container_width=True, hide_index=True)
+
+        # Visualizations (Scatter plot & Bar Chart)
+        c_v1, c_v2 = st.columns([1.5, 1.5])
+        with c_v1:
+            st.markdown("##### 🎯 Sales ($) vs. POS Hits Multicriteria Map")
+            scatter_chart = (
+                alt.Chart(clf["df"])
+                .mark_circle(size=100, opacity=0.85)
+                .encode(
+                    x=alt.X("Sales ($):Q", title="Annual Dollar Sales ($)"),
+                    y=alt.Y("Hits:Q", title="POS Hits (Pick Frequency)"),
+                    color=alt.Color(
+                        "Inventory Class:N",
+                        scale=alt.Scale(
+                            domain=["A", "B", "C", "D"],
+                            range=["#10b981", "#3b82f6", "#f59e0b", "#ef4444"],
+                        ),
+                        title="Inventory Class",
+                    ),
+                    tooltip=["Item Number", "Item Name", "Sales ($)", "Hits", "Inventory Class", "Composite Score"],
+                )
+                .properties(height=300)
+            )
+            st.altair_chart(scatter_chart, use_container_width=True)
+
+        with c_v2:
+            st.markdown("##### 📈 % of Sales vs. % of POS Hits by Class")
+            chart_df = pd.DataFrame([
+                {"Class": r["Class"], "Metric": "% of Sales (65% Wt)", "Percentage": r["% of Sales"]}
+                for r in s_rows
+            ] + [
+                {"Class": r["Class"], "Metric": "% of POS Hits (35% Wt)", "Percentage": r["% of POS Hits"]}
+                for r in s_rows
+            ])
+            bar_shares = (
+                alt.Chart(chart_df)
+                .mark_bar()
+                .encode(
+                    x=alt.X("Class:N", title="Inventory Class"),
+                    y=alt.Y("Percentage:Q", title="Percentage (%)"),
+                    color=alt.Color("Metric:N", scale=alt.Scale(range=["#0284c7", "#f59e0b"])),
+                    xOffset="Metric:N",
+                    tooltip=["Class", "Metric", "Percentage"],
+                )
+                .properties(height=300)
+            )
+            st.altair_chart(bar_shares, use_container_width=True)
+
+        # Filterable Classified Items Table
+        st.markdown("##### 📋 Classified Inventory Master Data")
+        class_filter = st.radio(
+            "Filter Display by Class:",
+            ["All Classes", "Class A", "Class B", "Class C", "Class D"],
+            horizontal=True,
+            key="inventory_class_filter_radio",
+        )
+        if class_filter == "All Classes":
+            st.dataframe(clf["df_display"], use_container_width=True)
+        else:
+            selected_letter = class_filter.split()[-1]
+            sub_display = clf["df_display"][clf["df"]["Inventory Class"] == selected_letter]
+            st.dataframe(sub_display, use_container_width=True)
+
 
 # -------------------------------------------------------------------------
 # UI Component: Dark Executive Recommendation Banner
@@ -683,6 +785,18 @@ def _render_executive_banner(model: str, results: Dict[str, Any], inter: Dict[st
             f"Highest-volume product: <strong>{top_prod}</strong> ({top_cnt:,} units). Overall inventory valuation is <strong>${val:,.2f}</strong>."
         )
 
+    elif model == "INVENTORY_CLASSIFICATION":
+        a_cnt = results.get("class_A_count", 0)
+        b_cnt = results.get("class_B_count", 0)
+        c_cnt = results.get("class_C_count", 0)
+        d_cnt = results.get("class_D_count", 0)
+        tot_cnt = results.get("total_records", 0)
+        headline = f"BAN 517 Multicriteria Classification: {tot_cnt:,} Items (A: {a_cnt}, B: {b_cnt}, C: {c_cnt}, D: {d_cnt})"
+        details = (
+            f"Items classified by <strong>Sales ($) weighted 65%</strong> and <strong>POS Hits weighted 35%</strong> using Pareto cutoffs. "
+            f"Class A represents <strong>{a_cnt} vital SKUs</strong> commanding priority control; Class D isolates <strong>{d_cnt} slow/dead stock items</strong>."
+        )
+
     else:
         headline = "Inventory Optimization Analysis Complete"
         details = "Review the decision parameters and execution trace below."
@@ -756,6 +870,15 @@ def _render_metric_cards(model: str, results: Dict[str, Any], inter: Dict[str, A
         c2.metric("Total Inventory Units", f"{results.get('total_units', 0):,}")
         c3.metric("Average Unit Cost", f"${results.get('average_unit_cost', 0.0):,.2f}")
         c4.metric("Total Inventory Value", f"${results.get('total_inventory_value', 0.0):,.2f}")
+
+    elif model == "INVENTORY_CLASSIFICATION":
+        c1, c2, c3, c4, c5, c6 = st.columns(6)
+        c1.metric("Class A (Vital)", f"{results.get('class_A_count', 0):,} SKUs", "Top 65%/35% priority")
+        c2.metric("Class B (Moderate)", f"{results.get('class_B_count', 0):,} SKUs", "Secondary velocity")
+        c3.metric("Class C (Low Activity)", f"{results.get('class_C_count', 0):,} SKUs", "Routine attention")
+        c4.metric("Class D (Slow / Dead)", f"{results.get('class_D_count', 0):,} SKUs", "Rationalization list")
+        c5.metric("Total Sales ($)", f"${results.get('total_sales', 0):,.2f}")
+        c6.metric("Total POS Hits", f"{results.get('total_hits', 0):,}")
 
 
 # -------------------------------------------------------------------------
@@ -1120,6 +1243,13 @@ def _render_analytics_tab(model: str, results: Dict[str, Any], inter: Dict[str, 
             st.altair_chart(bar_chart, use_container_width=True)
             st.dataframe(cat_df, use_container_width=True, hide_index=True)
 
+    elif model == "INVENTORY_CLASSIFICATION":
+        st.markdown("#### BAN 517 Multicriteria Classification Distribution")
+        st.caption("Stratification summary across Classes A, B, C, and D based on 65% Sales and 35% POS Hits.")
+        s_rows = results.get("class_summary", [])
+        if s_rows:
+            st.dataframe(pd.DataFrame(s_rows), use_container_width=True, hide_index=True)
+
 
 # -------------------------------------------------------------------------
 # Tab 3: What-If Parameter Sensitivity
@@ -1131,7 +1261,7 @@ def _render_sensitivity_tab(model: str, inputs: Dict[str, Any], baseline_results
     st.markdown(f"### 🎛️ What-If Parameter Sensitivity Analysis")
     st.caption("Adjust key supply chain drivers to observe real-time operational trade-offs calculated via pure Python analytical formulas.")
 
-    if model == "DATASET_ANALYSIS":
+    if model in ["DATASET_ANALYSIS", "INVENTORY_CLASSIFICATION"]:
         st.info("💡 **Dataset Sensitivity Analysis:** What-If parameter sliders apply to individual single-item models. To test sensitivity on a specific product from your dataset, ask a question such as: *'What is the EOQ for [Product Name] with ordering cost $50 and holding cost $2?'*")
         return
 

@@ -58,6 +58,7 @@ class InventoryDecisionAgent:
     MODEL_FIXED_PERIOD_REVIEW = "FIXED_PERIOD_REVIEW"
     MODEL_NEWSVENDOR = "NEWSVENDOR"
     MODEL_DATASET_ANALYSIS = "DATASET_ANALYSIS"
+    MODEL_INVENTORY_CLASSIFICATION = "INVENTORY_CLASSIFICATION"
 
     MODEL_TOOL_MAP = {
         MODEL_EOQ: "calculate_eoq",
@@ -66,6 +67,7 @@ class InventoryDecisionAgent:
         MODEL_FIXED_PERIOD_REVIEW: "calculate_fixed_period_review",
         MODEL_NEWSVENDOR: "calculate_newsvendor",
         MODEL_DATASET_ANALYSIS: "analyze_dataset_query",
+        MODEL_INVENTORY_CLASSIFICATION: "classify_inventory_multicriteria",
     }
 
     def __init__(self):
@@ -88,7 +90,20 @@ class InventoryDecisionAgent:
             self.MODEL_FIXED_PERIOD_REVIEW: 0.0,
             self.MODEL_NEWSVENDOR: 0.0,
             self.MODEL_DATASET_ANALYSIS: 0.0,
+            self.MODEL_INVENTORY_CLASSIFICATION: 0.0,
         }
+
+        # Multicriteria Inventory Classification cues
+        classification_cues = [
+            r"classif\w+", r"multicriteria", r"\babc\b", r"\babcd\b",
+            r"class a\b", r"class b\b", r"class c\b", r"class d\b",
+            r"slow[- ]mover[s]?", r"fast[- ]mover[s]?", r"pareto",
+            r"pos hits", r"vital few", r"category a\b", r"category b\b",
+            r"65%", r"35%", r"hits",
+        ]
+        for pat in classification_cues:
+            if re.search(pat, q_lower):
+                scores[self.MODEL_INVENTORY_CLASSIFICATION] += 3.5
 
         # Dataset Portfolio Queries (when dataset is present or dataset keywords are queried)
         if dataset_df is not None:
@@ -576,7 +591,12 @@ class InventoryDecisionAgent:
         # 11. Dataset Analysis & Decision Model Integration
         # ---------------------------------------------------------------------
         if dataset_df is not None:
-            if model == self.MODEL_DATASET_ANALYSIS:
+            if model == self.MODEL_INVENTORY_CLASSIFICATION:
+                inputs["dataset_df"] = dataset_df
+                inputs["sales_weight"] = 0.65
+                inputs["hits_weight"] = 0.35
+
+            elif model == self.MODEL_DATASET_ANALYSIS:
                 q_lower = q.lower()
                 if re.search(r"valuation|total\s+(?:inventory\s+)?value", q_lower):
                     inputs["query_focus"] = "total_valuation"
@@ -931,6 +951,14 @@ class InventoryDecisionAgent:
             matched = inputs.get("matched_product")
             return tool_callable(dataset_df=df_target, query_focus=focus, matched_product=matched)
 
+        elif model == self.MODEL_INVENTORY_CLASSIFICATION:
+            df_target = inputs.get("dataset_df")
+            if df_target is None:
+                raise ValueError("No dataset provided for inventory classification. Please upload a CSV file containing Sales ($) and Hits.")
+            s_w = inputs.get("sales_weight", 0.65)
+            h_w = inputs.get("hits_weight", 0.35)
+            return tool_callable(df_target, sales_weight=s_w, hits_weight=h_w)
+
         else:
             raise ValueError(f"Unsupported model: {model}")
 
@@ -980,6 +1008,11 @@ class InventoryDecisionAgent:
             rec_cnt = results.get("records_count", 0)
             notes.append(f"Examined {rec_cnt} inventory records from the uploaded dataset.")
             notes.append("Dataset schema, numeric values, and non-negativity checks verified.")
+
+        elif model == self.MODEL_INVENTORY_CLASSIFICATION:
+            rec_cnt = results.get("total_records", 0)
+            notes.append(f"Successfully classified {rec_cnt} inventory items into BAN 517 A, B, C, D classes.")
+            notes.append("Sales weighted 65%, POS Hits weighted 35%, 100% item conservation verified.")
 
         return {
             "status": status,
@@ -1094,6 +1127,17 @@ class InventoryDecisionAgent:
                 f"- **Average Unit Cost:** **${avg_cost:,.2f}** per unit",
                 f"- **Highest-Volume SKU:** **{top_prod}** ({top_units:,} units in stock / demand)",
                 f"- **Portfolio Takeaway:** {base_explanation}",
+            ])
+
+        elif model == self.MODEL_INVENTORY_CLASSIFICATION:
+            s_rows = results.get("class_summary", [])
+            lines.extend([
+                f"- **BAN 517 Methodology:** 65% Annual Dollar Sales ($) + 35% POS Pick Hits",
+                f"- **Class A (Vital Few):** **{results.get('class_A_count', 0):,} items** (Top throughput and financial priority)",
+                f"- **Class B (Moderate):** **{results.get('class_B_count', 0):,} items** (Secondary replenishment attention)",
+                f"- **Class C (Low Activity):** **{results.get('class_C_count', 0):,} items** (Routine periodic replenishment)",
+                f"- **Class D (Slow / Dead Stock):** **{results.get('class_D_count', 0):,} items** (Candidates for SKU rationalization or obsolescence review)",
+                f"- **Summary:** {base_explanation}",
             ])
 
         # If entity was matched from dataset in a decision model, highlight it
